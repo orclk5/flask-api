@@ -1,58 +1,60 @@
 from flask import Flask, request, jsonify
-import sqlite3
+import requests
+import base64
+import logging
+from flask import CORS
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
+CORS(app)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# SQLite Veritabanını Başlat
-def setup_database():
-    conn = sqlite3.connect("licenses.db")
-    cursor = conn.cursor()
+WOOCOMMERCE_URL = "https://epsonpedreset.com"  # WooCommerce site adresiniz
+WOOCOMMERCE_CONSUMER_KEY = "ck_3bc3155f21ad13877a116c8e3e5f26c5da5d2241" #WooCommerce REST API anahtarınız
+WOOCOMMERCE_CONSUMER_SECRET = "cs_f8ef467a7324dadfff97098ea010e9582868ddb0" #WooCommerce REST API gizli anahtarınız
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS license_keys (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT UNIQUE NOT NULL,
-            is_used BOOLEAN DEFAULT FALSE
-        )
-    """)
-
-    # Örnek lisans anahtarları ekleyelim
-    sample_keys = ["ABC12345", "XYZ98765", "DEF67890"]
-    for key in sample_keys:
-        try:
-            cursor.execute("INSERT INTO license_keys (license_key) VALUES (?)", (key,))
-        except sqlite3.IntegrityError:
-            pass  # Anahtar zaten varsa ekleme yapma
-
-    conn.commit()
-    conn.close()
-
-setup_database()
+def get_woocommerce_auth_header():
+    auth_str = f"{WOOCOMMERCE_CONSUMER_KEY}:{WOOCOMMERCE_CONSUMER_SECRET}"
+    encoded_auth = base64.b64encode(auth_str.encode()).decode()
+    return {"Authorization": f"Basic {encoded_auth}"}
 
 @app.route("/verify", methods=["POST"])
 def verify_license():
-    """Lisans anahtarını doğrular ve kullanılmış olarak işaretler."""
     data = request.json
     key = data.get("key")
-
     if not key:
-        return jsonify({"success": False, "message": "Lisans anahtarı gerekli!"})
+       logger.warning("Lisans anahtarı gerekli!")
+       return jsonify({"success": False, "message": "Lisans anahtarı gerekli!"}), 400
+    try:
 
-    conn = sqlite3.connect("licenses.db")
-    cursor = conn.cursor()
+        api_url = f"{WOOCOMMERCE_URL}/wp-json/wc/v3/orders"
+        headers = get_woocommerce_auth_header()
+        params = {"search": key}
 
-    cursor.execute("SELECT is_used FROM license_keys WHERE license_key = ?", (key,))
-    result = cursor.fetchone()
+        response = requests.get(api_url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        orders = response.json()
 
-    if result is None:
-        return jsonify({"success": False, "message": "Geçersiz Lisans Anahtarı!"})
-    elif result[0]:  # Anahtar daha önce kullanılmış mı?
-        return jsonify({"success": False, "message": "Bu lisans anahtarı zaten kullanılmış!"})
-    else:
-        cursor.execute("UPDATE license_keys SET is_used = 1 WHERE license_key = ?", (key,))
-        conn.commit()
-        conn.close()
-        return jsonify({"success": True, "message": "Lisans anahtarı doğrulandı ve artık kullanıldı!"})
+        if orders:
+            for order in orders:
+                if key == order.get("customer_note"):
+                     return jsonify({"success": True, "message": "Lisans anahtarı doğrulandı!"})
+            return jsonify({"success": False, "message": "Geçersiz Lisans Anahtarı"}), 401
+
+        else:
+             return jsonify({"success": False, "message": "Geçersiz Lisans Anahtarı"}), 401
+        
+    except requests.exceptions.RequestException as e:
+       logger.error(f"API İstek hatası: {e}")
+       return jsonify({"success": False, "message": f"API İsteği hatası: {e}"}), 500
+    except Exception as e:
+       logger.error(f"Beklenmeyen bir hata: {e}")
+       return jsonify({"success": False, "message": f"Beklenmeyen bir hata: {e}"}), 500
+@app.errorhandler(HTTPException)
+def handle_exception(e):
+    """HTTP Exceptionları yakalar ve JSON formatında cevap döndürür."""
+    return jsonify({"success": False, "message": str(e)}), e.code
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
